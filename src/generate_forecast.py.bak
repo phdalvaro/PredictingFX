@@ -1,0 +1,290 @@
+import pandas as pd
+import numpy as np
+import os
+import logging
+from datetime import datetime, timedelta
+import joblib
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+import matplotlib.pyplot as plt
+import seaborn as sns
+import sys
+
+# Imprimir información de depuración
+print("Directorio actual:", os.getcwd())
+print("Directorio del script:", os.path.dirname(os.path.abspath(__file__)))
+print("Python version:", sys.version)
+
+# Obtener la ruta absoluta del directorio del script
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+
+print("SCRIPT_DIR:", SCRIPT_DIR)
+print("PROJECT_ROOT:", PROJECT_ROOT)
+
+# Configurar logging
+log_dir = os.path.join(PROJECT_ROOT, 'logs')
+os.makedirs(log_dir, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(os.path.join(log_dir, 'generate_forecast.log')),
+        logging.StreamHandler()
+    ]
+)
+
+def load_models(base_path):
+    """Cargar modelos entrenados"""
+    try:
+        print(f"Cargando modelos desde: {base_path}")
+        models_dir = os.path.join(base_path, 'models')
+        print(f"Directorio de modelos: {models_dir}")
+        
+        # Cargar modelo de volumen
+        volume_model_path = os.path.join(models_dir, 'volume.joblib')
+        print(f"Cargando modelo de volumen desde: {volume_model_path}")
+        volume_model = joblib.load(volume_model_path)
+        
+        # Cargar modelos de próxima transacción
+        transaction_models = {}
+        for horizon in ['7d', '14d', '30d']:
+            model_path = os.path.join(models_dir, f'next_transaction_Opera_Proximos_{horizon}.joblib')
+            print(f"Cargando modelo de transacción {horizon} desde: {model_path}")
+            model_key = f'next_transaction_Opera_Proximos_{horizon}'
+            transaction_models[model_key] = joblib.load(model_path)
+        
+        # Cargar listas de características
+        volume_features_path = os.path.join(models_dir, 'volume_features.txt')
+        transaction_features_path = os.path.join(models_dir, 'transaction_features.txt')
+        
+        print(f"Cargando características de volumen desde: {volume_features_path}")
+        with open(volume_features_path, 'r', encoding='utf-8') as f:
+            volume_features = [line.strip() for line in f]
+        
+        print(f"Cargando características de transacción desde: {transaction_features_path}")
+        with open(transaction_features_path, 'r', encoding='utf-8') as f:
+            transaction_features = [line.strip() for line in f]
+        
+        print("Modelos y características cargados exitosamente")
+        return volume_model, transaction_models, volume_features, transaction_features
+    except Exception as e:
+        print(f"Error al cargar modelos: {str(e)}")
+        logging.error(f"Error al cargar modelos: {str(e)}")
+        raise
+
+def prepare_forecast_data(df, features, scaler=None, encoders=None):
+    """
+    Prepara los datos para el pronóstico.
+    """
+    logger = logging.getLogger(__name__)
+    
+    # Crear una copia del DataFrame
+    df_copy = df.copy()
+    
+    # Convertir la columna de fecha
+    df_copy['Fecha'] = pd.to_datetime(df_copy['Fecha de cierre'])
+    
+    # Calcular características temporales
+    df_copy['Año'] = df_copy['Fecha'].dt.year
+    df_copy['Mes'] = df_copy['Fecha'].dt.month
+    df_copy['Día'] = df_copy['Fecha'].dt.day
+    df_copy['Día de la semana'] = df_copy['Fecha'].dt.dayofweek
+    df_copy['Semana del año'] = df_copy['Fecha'].dt.isocalendar().week
+    df_copy['Es fin de semana'] = df_copy['Fecha'].dt.dayofweek.isin([5, 6]).astype(int)
+    df_copy['Es fin de mes'] = df_copy['Fecha'].dt.is_month_end.astype(int)
+    df_copy['Trimestre'] = df_copy['Fecha'].dt.quarter
+    df_copy['Mes del año'] = df_copy['Fecha'].dt.month
+    
+    # Verificar que todas las características necesarias estén presentes
+    missing_features = [f for f in features if f not in df_copy.columns]
+    if missing_features:
+        logger.warning(f"Características faltantes: {missing_features}")
+        raise ValueError(f"Faltan las siguientes características: {missing_features}")
+    
+    # Seleccionar solo las características necesarias
+    X = df_copy[features].copy()
+    
+    # Aplicar el escalador si se proporciona
+    if scaler is not None:
+        numerical_features = X.select_dtypes(include=['float64', 'int64']).columns
+        if len(numerical_features) > 0:
+            X[numerical_features] = scaler.transform(X[numerical_features])
+    
+    # Aplicar codificadores si se proporcionan
+    if encoders is not None:
+        for feature, encoder in encoders.items():
+            if feature in X.columns:
+                X[feature] = encoder.transform(X[feature])
+    
+    # Convertir variables categóricas a tipo category
+    categorical_features = X.select_dtypes(include=['object']).columns
+    for feature in categorical_features:
+        X[feature] = X[feature].astype('category')
+    
+    return X
+
+def generate_volume_forecast(model, df, features, scaler=None, label_encoders=None):
+    """
+    Genera pronóstico de volumen.
+    """
+    try:
+        # Preparar datos
+        X = prepare_forecast_data(df, features, scaler, label_encoders)
+        
+        # Generar pronóstico
+        predictions = model.predict(X)
+        
+        # Crear DataFrame con los resultados
+        forecast = pd.DataFrame({
+            'Fecha': df['Fecha de cierre'],
+            'Volumen_Pronosticado': predictions
+        })
+        
+        return forecast, scaler, label_encoders
+    except Exception as e:
+        logging.error(f"Error al generar pronóstico de volumen: {str(e)}")
+        raise
+
+def generate_transaction_forecast(models, df, features, scaler=None, encoders=None):
+    """
+    Genera pronóstico de próxima transacción.
+    """
+    try:
+        # Preparar datos
+        X = prepare_forecast_data(df, features, scaler, encoders)
+        
+        # Generar pronóstico para cada horizonte
+        probas = {}
+        for horizon in ['7d', '14d', '30d']:
+            model_key = f'next_transaction_Opera_Proximos_{horizon}'
+            if model_key not in models:
+                raise KeyError(f"No se encontró el modelo para el horizonte {horizon}")
+            probas[horizon] = models[model_key].predict_proba(X)[:, 1]
+        
+        # Crear DataFrame con los resultados
+        forecast = pd.DataFrame({
+            'Fecha': df['Fecha de cierre'],
+            'Probabilidad_Proxima_Transaccion_7d': probas['7d'],
+            'Probabilidad_Proxima_Transaccion_14d': probas['14d'],
+            'Probabilidad_Proxima_Transaccion_30d': probas['30d']
+        })
+        
+        return forecast, scaler, encoders
+    except Exception as e:
+        logging.error(f"Error al generar pronóstico de próxima transacción: {str(e)}")
+        raise
+
+def plot_forecasts(volume_forecast, transaction_forecast, output_dir):
+    """Generar visualizaciones de los pronósticos"""
+    try:
+        # Crear directorio para gráficos si no existe
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Configurar el estilo de los gráficos
+        plt.style.use('default')
+        
+        # 1. Gráfico de volumen pronosticado
+        plt.figure(figsize=(12, 6))
+        plt.plot(volume_forecast['Fecha'], volume_forecast['Volumen_Pronosticado'], linewidth=2)
+        plt.title('Pronóstico de Volumen', fontsize=14, pad=20)
+        plt.xlabel('Fecha', fontsize=12)
+        plt.ylabel('Volumen', fontsize=12)
+        plt.grid(True, alpha=0.3)
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'volume_forecast.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # 2. Gráfico de probabilidades de próxima transacción
+        plt.figure(figsize=(12, 6))
+        for horizon in ['7d', '14d', '30d']:
+            col = f'Probabilidad_Proxima_Transaccion_{horizon}'
+            plt.plot(transaction_forecast['Fecha'], 
+                    transaction_forecast[col], 
+                    linewidth=2, 
+                    label=f'Horizonte {horizon}')
+        
+        plt.title('Probabilidades de Próxima Transacción', fontsize=14, pad=20)
+        plt.xlabel('Fecha', fontsize=12)
+        plt.ylabel('Probabilidad', fontsize=12)
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'transaction_forecast.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        logging.info("Visualizaciones generadas exitosamente")
+    except Exception as e:
+        logging.error(f"Error al generar visualizaciones: {str(e)}")
+        raise
+
+def load_features(filename):
+    """
+    Carga las características desde un archivo.
+    """
+    try:
+        # Obtener ruta base del proyecto
+        base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        features_path = os.path.join(base_path, 'models', filename)
+        
+        # Cargar características desde el archivo
+        with open(features_path, 'r', encoding='utf-8') as f:
+            features = [line.strip() for line in f]
+        
+        return features
+    except Exception as e:
+        logging.error(f"Error al cargar características: {str(e)}")
+        raise
+
+def main():
+    """Función principal"""
+    try:
+        # Obtener ruta base del proyecto
+        base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        
+        # Cargar datos con características
+        features_path = os.path.join(base_path, 'data', 'processed', 'features.csv')
+        df = pd.read_csv(features_path)
+        
+        # Cargar modelos y características
+        volume_model, transaction_models, volume_features, transaction_features = load_models(base_path)
+        
+        # Generar pronósticos
+        volume_forecast, volume_scaler, volume_encoders = generate_volume_forecast(
+            volume_model, df, volume_features
+        )
+        
+        transaction_forecast, transaction_scaler, transaction_encoders = generate_transaction_forecast(
+            transaction_models, df, transaction_features
+        )
+        
+        # Crear directorio para pronósticos
+        forecast_dir = os.path.join(base_path, 'data', 'processed', 'forecasts')
+        os.makedirs(forecast_dir, exist_ok=True)
+        
+        # Guardar pronósticos
+        volume_forecast.to_csv(os.path.join(forecast_dir, 'volume_forecast.csv'), index=False)
+        transaction_forecast.to_csv(os.path.join(forecast_dir, 'transaction_forecast.csv'), index=False)
+        
+        # Generar visualizaciones
+        plot_forecasts(volume_forecast, transaction_forecast, forecast_dir)
+        
+        logging.info("Pronósticos generados exitosamente")
+        
+        # Imprimir resumen de pronósticos
+        print("\nResumen de Pronósticos:")
+        print(f"Rango de fechas: {volume_forecast['Fecha'].min()} a {volume_forecast['Fecha'].max()}")
+        print(f"Volumen promedio pronosticado: {volume_forecast['Volumen_Pronosticado'].mean():.2f}")
+        print("\nProbabilidades de próxima transacción:")
+        for horizon in ['7d', '14d', '30d']:
+            col = f'Probabilidad_Proxima_Transaccion_{horizon}'
+            print(f"{horizon}: {transaction_forecast[col].mean():.2%}")
+        
+    except Exception as e:
+        logging.error(f"Error en el proceso principal: {str(e)}")
+        raise
+
+if __name__ == "__main__":
+    main() 
