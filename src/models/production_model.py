@@ -17,16 +17,21 @@ from cryptography.fernet import Fernet
 import base64
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
 
 # Configurar logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('logs/production.log'),
+        logging.FileHandler('logs/production_model.log'),
         logging.StreamHandler()
     ]
 )
+logger = logging.getLogger(__name__)
 
 class SecurityManager:
     """Manejador de seguridad para el modelo."""
@@ -283,546 +288,286 @@ class SecurityError(Exception):
     pass
 
 class ProductionModel:
-    def __init__(self, model_path: str, scaler_path: Optional[str] = None, 
-                 threshold_rmse: float = 1000, threshold_mae: float = 500,
+    """
+    Clase para el modelo en producción que incluye validaciones, monitoreo y predicciones.
+    """
+    
+    def __init__(self, 
+                 model_path: str = 'models/xgboost_model.pkl',
+                 scaler_path: str = 'models/scaler.pkl',
+                 threshold_rmse: float = 100.0,
+                 threshold_mae: float = 50.0,
                  drift_threshold: float = 0.1):
         """
         Inicializa el modelo de producción.
         
         Args:
-            model_path: Ruta al modelo guardado
-            scaler_path: Ruta al scaler guardado (opcional)
-            threshold_rmse: Umbral de alerta para RMSE
-            threshold_mae: Umbral de alerta para MAE
+            model_path: Ruta al modelo entrenado
+            scaler_path: Ruta al scaler entrenado
+            threshold_rmse: Umbral de RMSE para alertas
+            threshold_mae: Umbral de MAE para alertas
             drift_threshold: Umbral para detección de drift
         """
-        self.model_path = model_path
-        self.scaler_path = scaler_path
-        self.threshold_rmse = threshold_rmse
-        self.threshold_mae = threshold_mae
-        self.drift_threshold = drift_threshold
-        self.security_manager = SecurityManager()
-        self.model = self._load_model()
-        self.scaler = self._load_scaler()
-        self.predictions_history = []
-        self.metrics_history = []
-        self.feature_stats_history = []
-        
-    def _load_model(self) -> object:
-        """
-        Carga el modelo de forma segura.
-        
-        Returns:
-            object: Modelo cargado
-        """
         try:
-            if not os.path.exists(self.model_path):
-                raise FileNotFoundError(f"Modelo no encontrado en {self.model_path}")
+            logger.info("Inicializando modelo de producción")
             
-            # Verificar integridad del modelo
-            model_hash = self.security_manager.generate_hash(open(self.model_path, 'rb').read())
-            if not self._verify_model_integrity(model_hash):
-                raise SecurityError("Integridad del modelo comprometida")
+            # Cargar modelo y scaler
+            self.model = joblib.load(model_path)
+            self.scaler = joblib.load(scaler_path)
             
-            return joblib.load(self.model_path)
+            # Cargar configuración de features
+            self.feature_importance = pd.read_csv('results/feature_importance.csv')
+            self.top_features = self.feature_importance.head(15)['Feature'].tolist()
+            
+            # Configurar umbrales
+            self.threshold_rmse = threshold_rmse
+            self.threshold_mae = threshold_mae
+            self.drift_threshold = drift_threshold
+            
+            # Crear directorios necesarios
+            self.results_dir = Path('results/production')
+            self.results_dir.mkdir(parents=True, exist_ok=True)
+            
+            logger.info("Modelo de producción inicializado exitosamente")
+            
         except Exception as e:
-            logging.error(f"Error al cargar el modelo: {str(e)}")
+            logger.error(f"Error al inicializar el modelo: {str(e)}")
             raise
     
-    def _load_scaler(self) -> Optional[object]:
+    def validate_data(self, df: pd.DataFrame) -> Tuple[bool, str]:
         """
-        Carga el scaler de forma segura.
+        Valida los datos de entrada.
         
+        Args:
+            df: DataFrame con los datos a validar
+            
         Returns:
-            Optional[object]: Scaler cargado o None
+            Tuple[bool, str]: (es_válido, mensaje)
         """
         try:
-            if not self.scaler_path or not os.path.exists(self.scaler_path):
-                return None
+            # Verificar columnas requeridas
+            missing_cols = [col for col in self.top_features if col not in df.columns]
+            if missing_cols:
+                return False, f"Columnas faltantes: {missing_cols}"
             
-            # Verificar integridad del scaler
-            scaler_hash = self.security_manager.generate_hash(open(self.scaler_path, 'rb').read())
-            if not self._verify_scaler_integrity(scaler_hash):
-                raise SecurityError("Integridad del scaler comprometida")
+            # Verificar valores negativos en columnas numéricas
+            numeric_cols = df[self.top_features].select_dtypes(include=[np.number]).columns
+            neg_counts = (df[numeric_cols] < 0).sum()
+            if neg_counts.any():
+                return False, f"Valores negativos encontrados en: {neg_counts[neg_counts > 0].to_dict()}"
             
-            return joblib.load(self.scaler_path)
+            # Verificar tipos de datos
+            for col in self.top_features:
+                if col in numeric_cols and not np.issubdtype(df[col].dtype, np.number):
+                    return False, f"Tipo de dato incorrecto en columna {col}"
+            
+            # Registrar columnas con valores nulos (pero no fallar)
+            null_counts = df[self.top_features].isnull().sum()
+            if null_counts.any():
+                logger.warning(f"Se encontraron valores nulos que serán imputados en: {null_counts[null_counts > 0].to_dict()}")
+            
+            return True, "Datos válidos"
+            
         except Exception as e:
-            logging.error(f"Error al cargar el scaler: {str(e)}")
+            logger.error(f"Error en validación de datos: {str(e)}")
+            return False, str(e)
+    
+    def prepare_features(self, df: pd.DataFrame) -> np.ndarray:
+        """
+        Prepara las features para la predicción.
+        
+        Args:
+            df: DataFrame con los datos de entrada
+            
+        Returns:
+            np.ndarray: Features preparadas
+        """
+        try:
+            # Seleccionar features
+            X = df[self.top_features].copy()
+            
+            # Imputar valores nulos con la mediana
+            for col in X.columns:
+                if X[col].isnull().any():
+                    logger.info(f"Imputando valores nulos en columna {col} con la mediana")
+                    X[col] = X[col].fillna(X[col].median())
+            
+            # Escalar features
+            X_scaled = self.scaler.transform(X)
+            
+            return X_scaled
+            
+        except Exception as e:
+            logger.error(f"Error al preparar features: {str(e)}")
             raise
     
-    def _verify_model_integrity(self, current_hash: str) -> bool:
+    def generate_predictions(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Verifica la integridad del modelo.
+        Genera predicciones para los datos de entrada.
         
         Args:
-            current_hash: Hash actual del modelo
+            df: DataFrame con los datos de entrada
             
         Returns:
-            bool: True si la integridad está verificada
+            pd.DataFrame: DataFrame con predicciones
         """
         try:
-            hash_file = f"{self.model_path}.hash"
-            if not os.path.exists(hash_file):
-                with open(hash_file, 'w') as f:
-                    f.write(current_hash)
-                return True
+            # Validar datos
+            is_valid, message = self.validate_data(df)
+            if not is_valid:
+                raise ValueError(f"Datos inválidos: {message}")
             
-            with open(hash_file, 'r') as f:
-                stored_hash = f.read().strip()
+            # Preparar features
+            X_scaled = self.prepare_features(df)
             
-            return current_hash == stored_hash
+            # Generar predicciones
+            predictions = self.model.predict(X_scaled)
+            
+            # Crear DataFrame de resultados
+            results = df.copy()
+            results['predicted_importe_fx'] = predictions
+            results['prediction_timestamp'] = datetime.now()
+            
+            return results
+            
         except Exception as e:
-            logging.error(f"Error al verificar integridad del modelo: {str(e)}")
-            return False
-    
-    def _verify_scaler_integrity(self, current_hash: str) -> bool:
-        """
-        Verifica la integridad del scaler.
-        
-        Args:
-            current_hash: Hash actual del scaler
-            
-        Returns:
-            bool: True si la integridad está verificada
-        """
-        try:
-            hash_file = f"{self.scaler_path}.hash"
-            if not os.path.exists(hash_file):
-                with open(hash_file, 'w') as f:
-                    f.write(current_hash)
-                return True
-            
-            with open(hash_file, 'r') as f:
-                stored_hash = f.read().strip()
-            
-            return current_hash == stored_hash
-        except Exception as e:
-            logging.error(f"Error al verificar integridad del scaler: {str(e)}")
-            return False
+            logger.error(f"Error al generar predicciones: {str(e)}")
+            raise
     
     def detect_data_drift(self, df: pd.DataFrame) -> Dict:
         """
         Detecta drift en los datos de entrada.
         
         Args:
-            df: DataFrame con los datos actuales
+            df: DataFrame con los datos de entrada
             
         Returns:
-            Dict con métricas de drift
+            Dict: Resultados del análisis de drift
         """
         try:
-            drift_metrics = {}
+            # Cargar datos de entrenamiento para comparación
+            train_data = pd.read_csv('data/processed/features_data.csv', low_memory=False)
             
-            # Calcular estadísticas actuales
-            current_stats = df.describe()
+            drift_results = {}
             
-            # Cargar estadísticas históricas
-            stats_path = Path('results/feature_stats_history.json')
-            if stats_path.exists():
-                with open(stats_path, 'r') as f:
-                    historical_stats = json.load(f)
-                
-                # Comparar con estadísticas históricas
-                for column in current_stats.columns:
-                    if column in historical_stats[-1]:
-                        mean_diff = abs(current_stats[column]['mean'] - historical_stats[-1][column]['mean'])
-                        std_diff = abs(current_stats[column]['std'] - historical_stats[-1][column]['std'])
-                        
-                        drift_metrics[column] = {
-                            'mean_drift': mean_diff,
-                            'std_drift': std_diff,
-                            'drift_detected': mean_diff > self.drift_threshold or std_diff > self.drift_threshold
-                        }
+            # Analizar drift en cada feature
+            for feature in self.top_features:
+                if feature in train_data.columns:
+                    # Calcular estadísticas
+                    train_mean = train_data[feature].mean()
+                    train_std = train_data[feature].std()
+                    current_mean = df[feature].mean()
+                    current_std = df[feature].std()
+                    
+                    # Calcular drift
+                    mean_drift = abs(current_mean - train_mean) / train_mean
+                    std_drift = abs(current_std - train_std) / train_std
+                    has_drift = mean_drift > self.drift_threshold or std_drift > self.drift_threshold
+                    
+                    drift_results[feature] = {
+                        'mean_drift': float(mean_drift),
+                        'std_drift': float(std_drift),
+                        'has_drift': int(has_drift)  # Convertir bool a int
+                    }
             
-            # Guardar estadísticas actuales
-            self.feature_stats_history.append(current_stats.to_dict())
-            self.save_feature_stats()
+            return drift_results
             
-            return drift_metrics
         except Exception as e:
-            logging.error(f"Error al detectar drift: {str(e)}")
+            logger.error(f"Error al detectar drift: {str(e)}")
             raise
     
-    def save_feature_stats(self) -> None:
+    def evaluate_predictions(self, df: pd.DataFrame) -> Dict:
         """
-        Guarda el historial de estadísticas de features.
-        """
-        try:
-            stats_path = Path('results/feature_stats_history.json')
-            with open(stats_path, 'w') as f:
-                json.dump(self.feature_stats_history, f, indent=4)
-            
-            logging.info(f"Estadísticas de features guardadas en {stats_path}")
-        except Exception as e:
-            logging.error(f"Error al guardar estadísticas de features: {str(e)}")
-            raise
-    
-    def generate_dashboard(self) -> None:
-        """
-        Genera un dashboard interactivo con las métricas y predicciones.
-        """
-        try:
-            # Crear figura con subplots
-            fig = make_subplots(
-                rows=2, cols=2,
-                subplot_titles=('Predicciones vs Valores Reales', 
-                              'Métricas de Rendimiento',
-                              'Importancia de Features',
-                              'Drift de Datos')
-            )
-            
-            # Optimizar datos para visualización
-            if self.predictions_history:
-                # Limitar a últimos 30 días para mejor rendimiento
-                pred_df = pd.DataFrame(self.predictions_history[-30:])
-                pred_df['Fecha'] = pd.to_datetime(pred_df['Fecha'])
-                
-                # Agregar predicciones
-                fig.add_trace(
-                    go.Scatter(x=pred_df['Fecha'], y=pred_df['Predicción'],
-                              name='Predicción', line=dict(color='blue')),
-                    row=1, col=1
-                )
-                
-                # Agregar intervalos de confianza
-                fig.add_trace(
-                    go.Scatter(x=pred_df['Fecha'], y=pred_df['Intervalo_Superior'],
-                              fill=None, mode='lines', line_color='rgba(0,100,80,0.2)',
-                              name='Intervalo Superior'),
-                    row=1, col=1
-                )
-                fig.add_trace(
-                    go.Scatter(x=pred_df['Fecha'], y=pred_df['Intervalo_Inferior'],
-                              fill='tonexty', mode='lines', line_color='rgba(0,100,80,0.2)',
-                              name='Intervalo Inferior'),
-                    row=1, col=1
-                )
-            
-            # Gráfico de métricas optimizado
-            if self.metrics_history:
-                metrics_df = pd.DataFrame(self.metrics_history[-30:])
-                metrics_df['timestamp'] = pd.to_datetime(metrics_df['timestamp'])
-                
-                # Agregar métricas con colores diferentes
-                fig.add_trace(
-                    go.Scatter(x=metrics_df['timestamp'], y=metrics_df['rmse'],
-                              name='RMSE', line=dict(color='red')),
-                    row=2, col=1
-                )
-                fig.add_trace(
-                    go.Scatter(x=metrics_df['timestamp'], y=metrics_df['mae'],
-                              name='MAE', line=dict(color='green')),
-                    row=2, col=1
-                )
-                fig.add_trace(
-                    go.Scatter(x=metrics_df['timestamp'], y=metrics_df['r2'],
-                              name='R²', line=dict(color='blue')),
-                    row=2, col=1
-                )
-            
-            # Gráfico de importancia de features optimizado
-            importance = self.get_feature_importance()
-            fig.add_trace(
-                go.Bar(x=importance['feature'], y=importance['importance'],
-                      name='Importancia', marker_color='rgb(55, 83, 109)'),
-                row=1, col=2
-            )
-            
-            # Gráfico de drift optimizado
-            if self.feature_stats_history:
-                drift_df = pd.DataFrame([
-                    {col: stats[col]['mean'] 
-                     for col in stats.keys()}
-                    for stats in self.feature_stats_history[-30:]
-                ])
-                fig.add_trace(
-                    go.Heatmap(z=drift_df.values,
-                              x=drift_df.columns,
-                              y=drift_df.index,
-                              name='Drift',
-                              colorscale='RdBu'),
-                    row=2, col=2
-                )
-            
-            # Actualizar layout con mejoras visuales
-            fig.update_layout(
-                height=800,
-                title_text="Dashboard de Monitoreo del Modelo",
-                showlegend=True,
-                template='plotly_white',
-                hovermode='x unified',
-                plot_bgcolor='rgba(0,0,0,0)',
-                paper_bgcolor='rgba(0,0,0,0)',
-                margin=dict(l=50, r=50, t=50, b=50)
-            )
-            
-            # Actualizar ejes y títulos
-            fig.update_xaxes(title_text="Fecha", row=1, col=1)
-            fig.update_xaxes(title_text="Fecha", row=2, col=1)
-            fig.update_xaxes(title_text="Features", row=1, col=2)
-            fig.update_xaxes(title_text="Features", row=2, col=2)
-            
-            fig.update_yaxes(title_text="Volumen", row=1, col=1)
-            fig.update_yaxes(title_text="Métricas", row=2, col=1)
-            fig.update_yaxes(title_text="Importancia", row=1, col=2)
-            fig.update_yaxes(title_text="Días", row=2, col=2)
-            
-            # Guardar dashboard con configuración optimizada
-            dashboard_path = Path('results/dashboard.html')
-            fig.write_html(
-                dashboard_path,
-                config={'responsive': True},
-                include_plotlyjs='cdn',
-                full_html=True
-            )
-            
-            logging.info(f"Dashboard generado en {dashboard_path}")
-        except Exception as e:
-            logging.error(f"Error al generar dashboard: {str(e)}")
-            raise
-    
-    def _optimize_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Optimiza el DataFrame para mejor rendimiento.
+        Evalúa las predicciones generadas.
         
         Args:
-            df: DataFrame a optimizar
+            df: DataFrame con predicciones y valores reales
             
         Returns:
-            DataFrame optimizado
+            Dict: Métricas de evaluación
         """
         try:
-            # Optimizar tipos de datos
-            for col in df.columns:
-                if df[col].dtype == 'float64':
-                    df[col] = pd.to_numeric(df[col], downcast='float')
-                elif df[col].dtype == 'int64':
-                    df[col] = pd.to_numeric(df[col], downcast='integer')
-                elif df[col].dtype == 'object':
-                    if df[col].nunique() / len(df) < 0.5:
-                        df[col] = df[col].astype('category')
+            # Calcular métricas
+            y_true = df['Importe FX']
+            y_pred = df['predicted_importe_fx']
             
-            return df
-        except Exception as e:
-            logging.error(f"Error al optimizar DataFrame: {str(e)}")
-            raise
-    
-    def validate_data(self, df: pd.DataFrame) -> Tuple[bool, List[str]]:
-        """
-        Valida los datos de entrada.
-        
-        Args:
-            df: DataFrame con los datos
-            
-        Returns:
-            Tuple con (bool indicando si los datos son válidos, lista de errores)
-        """
-        try:
-            errors = []
-            
-            # Verificar columnas requeridas
-            required_columns = ['Importe FX', 'Volumen_promedio_diario', 'Spread_TC', 
-                              'Volumen_Ponderado_5', 'Volumen_diario']
-            missing_columns = [col for col in required_columns if col not in df.columns]
-            if missing_columns:
-                errors.append(f"Columnas faltantes: {missing_columns}")
-            
-            # Verificar valores nulos
-            null_counts = df[required_columns].isnull().sum()
-            if null_counts.any():
-                errors.append(f"Valores nulos encontrados: {null_counts[null_counts > 0].to_dict()}")
-            
-            # Verificar valores negativos
-            for col in required_columns:
-                if (df[col] < 0).any():
-                    errors.append(f"Valores negativos encontrados en columna {col}")
-            
-            # Verificar outliers
-            for col in required_columns:
-                Q1 = df[col].quantile(0.25)
-                Q3 = df[col].quantile(0.75)
-                IQR = Q3 - Q1
-                outliers = df[(df[col] < Q1 - 1.5 * IQR) | (df[col] > Q3 + 1.5 * IQR)]
-                if not outliers.empty:
-                    errors.append(f"Outliers detectados en columna {col}: {len(outliers)} registros")
-            
-            # Verificar tipos de datos
-            for col in required_columns:
-                if not np.issubdtype(df[col].dtype, np.number):
-                    errors.append(f"Tipo de dato incorrecto en columna {col}")
-            
-            # Verificar rangos de valores
-            if (df['Spread_TC'] > 1).any():
-                errors.append("Valores de Spread_TC fuera de rango (> 1)")
-            
-            return len(errors) == 0, errors
-        except Exception as e:
-            logging.error(f"Error en validación de datos: {str(e)}")
-            raise
-        
-    def prepare_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Prepara las features para el modelo.
-        
-        Args:
-            df: DataFrame con los datos
-            
-        Returns:
-            DataFrame con features preparadas
-        """
-        try:
-            # Validar datos
-            is_valid, errors = self.validate_data(df)
-            if not is_valid:
-                raise ValueError(f"Error de validación: {errors}")
-            
-            # Crear features de interacción
-            df['Importe_FX_Volumen_Promedio'] = df['Importe FX'] * df['Volumen_promedio_diario']
-            df['Importe_FX_Spread'] = df['Importe FX'] * df['Spread_TC']
-            df['Volumen_Ponderado_Spread'] = df['Volumen_Ponderado_5'] * df['Spread_TC']
-            df['Volumen_Importe_Ratio'] = df['Volumen_diario'] / df['Importe FX']
-            df['Spread_Volumen_Ratio'] = df['Spread_TC'] / df['Volumen_diario']
-            
-            # Eliminar columnas no necesarias
-            categorical_columns = [
-                'Codigo del Cliente (IBS)',
-                'Mes del año',
-                'Día de la semana nombre',
-                'Categoria_Cliente',
-                'Frecuencia_Cliente',
-                'Proxima_Fecha'
-            ]
-            
-            df = df.drop(categorical_columns + ['Fecha de cierre', 'Volumen_diario'], axis=1, errors='ignore')
-            
-            # Normalizar features si hay scaler
-            if self.scaler is not None:
-                numeric_columns = df.select_dtypes(include=['float64', 'int64']).columns
-                df[numeric_columns] = self.scaler.transform(df[numeric_columns])
-            
-            return df
-        except Exception as e:
-            logging.error(f"Error al preparar features: {str(e)}")
-            raise
-    
-    def generate_predictions(self, df: pd.DataFrame, horizon: int = 7) -> pd.DataFrame:
-        """
-        Genera predicciones para los próximos días.
-        
-        Args:
-            df: DataFrame con datos históricos
-            horizon: Número de días a predecir
-            
-        Returns:
-            DataFrame con predicciones
-        """
-        try:
-            # Optimizar DataFrame
-            df = self._optimize_dataframe(df)
-            
-            # Preparar features
-            X = self.prepare_features(df)
-            
-            # Generar predicciones
-            predictions = self.model.predict(X)
-            
-            # Calcular intervalos de confianza dinámicos
-            std_dev = np.std(predictions)
-            confidence_intervals = 1.96 * std_dev / np.sqrt(len(predictions))
-            
-            # Crear DataFrame con predicciones
-            results = pd.DataFrame({
-                'Fecha': df['Fecha de cierre'],
-                'Predicción': predictions,
-                'Intervalo_Inferior': predictions - confidence_intervals,
-                'Intervalo_Superior': predictions + confidence_intervals,
-                'Confianza': 0.95
-            })
-            
-            # Optimizar DataFrame de resultados
-            results = self._optimize_dataframe(results)
-            
-            # Guardar predicciones
-            self.save_predictions(results)
-            
-            return results
-        except Exception as e:
-            logging.error(f"Error al generar predicciones: {str(e)}")
-            raise
-    
-    def evaluate_predictions(self, predictions: pd.DataFrame, actual_values: pd.Series) -> Dict:
-        """
-        Evalúa las predicciones contra valores reales.
-        
-        Args:
-            predictions: DataFrame con predicciones
-            actual_values: Serie con valores reales
-            
-        Returns:
-            Dict con métricas de evaluación
-        """
-        try:
             metrics = {
-                'rmse': np.sqrt(mean_squared_error(actual_values, predictions['Predicción'])),
-                'mae': mean_absolute_error(actual_values, predictions['Predicción']),
-                'r2': r2_score(actual_values, predictions['Predicción']),
-                'timestamp': datetime.now().isoformat()
+                'rmse': float(np.sqrt(np.mean((y_true - y_pred) ** 2))),
+                'mae': float(np.mean(np.abs(y_true - y_pred))),
+                'r2': float(1 - np.sum((y_true - y_pred) ** 2) / np.sum((y_true - np.mean(y_true)) ** 2)),
+                'mape': float(np.mean(np.abs((y_true - y_pred) / y_true)) * 100)
             }
             
-            # Guardar métricas
-            self.save_metrics(metrics)
+            # Verificar umbrales y convertir booleanos a enteros
+            metrics['rmse_alert'] = int(metrics['rmse'] > self.threshold_rmse)
+            metrics['mae_alert'] = int(metrics['mae'] > self.threshold_mae)
             
             return metrics
+            
         except Exception as e:
-            logging.error(f"Error al evaluar predicciones: {str(e)}")
+            logger.error(f"Error al evaluar predicciones: {str(e)}")
             raise
     
-    def save_predictions(self, predictions: pd.DataFrame) -> None:
+    def save_predictions(self, df: pd.DataFrame, filename: Optional[str] = None):
         """
-        Guarda las predicciones en el historial.
+        Guarda las predicciones generadas.
         
         Args:
-            predictions: DataFrame con predicciones
+            df: DataFrame con predicciones
+            filename: Nombre opcional del archivo
         """
         try:
-            # Convertir predicciones a dict
-            pred_dict = predictions.to_dict(orient='records')
+            if filename is None:
+                filename = f"predictions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
             
-            # Agregar timestamp
-            for pred in pred_dict:
-                pred['timestamp'] = datetime.now().isoformat()
+            # Guardar predicciones
+            df.to_csv(self.results_dir / filename, index=False)
+            logger.info(f"Predicciones guardadas en {filename}")
             
-            # Agregar al historial
-            self.predictions_history.extend(pred_dict)
-            
-            # Guardar en archivo
-            predictions_path = Path('results/predictions_history.json')
-            with open(predictions_path, 'w') as f:
-                json.dump(self.predictions_history, f, indent=4)
-            
-            logging.info(f"Predicciones guardadas en {predictions_path}")
         except Exception as e:
-            logging.error(f"Error al guardar predicciones: {str(e)}")
+            logger.error(f"Error al guardar predicciones: {str(e)}")
             raise
     
-    def save_metrics(self, metrics: Dict) -> None:
+    def save_metrics(self, metrics: Dict, drift_results: Dict):
         """
-        Guarda las métricas en el historial.
+        Guarda las métricas de evaluación y drift.
         
         Args:
-            metrics: Dict con métricas de evaluación
+            metrics: Diccionario con métricas de evaluación
+            drift_results: Diccionario con resultados de drift
         """
         try:
-            self.metrics_history.append(metrics)
+            # Convertir booleanos a enteros para serialización JSON
+            metrics_json = {}
+            for key, value in metrics.items():
+                if isinstance(value, bool):
+                    metrics_json[key] = int(value)
+                else:
+                    metrics_json[key] = value
             
-            # Guardar en archivo
-            metrics_path = Path('results/metrics_history.json')
-            with open(metrics_path, 'w') as f:
-                json.dump(self.metrics_history, f, indent=4)
+            drift_results_json = {}
+            for feature, results in drift_results.items():
+                drift_results_json[feature] = {
+                    k: int(v) if isinstance(v, bool) else v
+                    for k, v in results.items()
+                }
             
-            logging.info(f"Métricas guardadas en {metrics_path}")
+            # Crear diccionario con resultados
+            results = {
+                'timestamp': datetime.now().isoformat(),
+                'metrics': metrics_json,
+                'drift_results': drift_results_json
+            }
+            
+            # Guardar resultados
+            filename = f"metrics_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            with open(self.results_dir / filename, 'w') as f:
+                json.dump(results, f, indent=4)
+            
+            logger.info(f"Métricas guardadas en {filename}")
+            
         except Exception as e:
-            logging.error(f"Error al guardar métricas: {str(e)}")
+            logger.error(f"Error al guardar métricas: {str(e)}")
             raise
     
     def get_feature_importance(self) -> pd.DataFrame:
@@ -830,66 +575,97 @@ class ProductionModel:
         Obtiene la importancia de las features.
         
         Returns:
-            DataFrame con importancia de features
+            pd.DataFrame: DataFrame con importancia de features
+        """
+        return self.feature_importance
+    
+    def generate_dashboard(self, df: pd.DataFrame, metrics: Dict, drift_results: Dict):
+        """
+        Genera un dashboard con visualizaciones de las predicciones.
+        
+        Args:
+            df: DataFrame con predicciones
+            metrics: Diccionario con métricas
+            drift_results: Diccionario con resultados de drift
         """
         try:
-            importance = pd.DataFrame({
-                'feature': self.model.feature_names_in_,
-                'importance': self.model.feature_importances_
-            })
-            importance = importance.sort_values('importance', ascending=False)
+            # Crear directorio para gráficos
+            plots_dir = self.results_dir / 'plots'
+            plots_dir.mkdir(exist_ok=True)
             
-            # Guardar importancia
-            importance_path = Path('results/feature_importance_production.csv')
-            importance.to_csv(importance_path, index=False)
+            # 1. Gráfico de predicciones vs valores reales
+            plt.figure(figsize=(10, 6))
+            plt.scatter(df['Importe FX'], df['predicted_importe_fx'], alpha=0.5)
+            plt.plot([df['Importe FX'].min(), df['Importe FX'].max()], 
+                    [df['Importe FX'].min(), df['Importe FX'].max()], 
+                    'r--', label='Línea perfecta')
+            plt.xlabel('Valores Reales')
+            plt.ylabel('Predicciones')
+            plt.title('Predicciones vs Valores Reales')
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(plots_dir / 'predictions_vs_real.png')
+            plt.close()
             
-            return importance
+            # 2. Gráfico de errores
+            plt.figure(figsize=(10, 6))
+            errors = df['Importe FX'] - df['predicted_importe_fx']
+            sns.histplot(errors, bins=50)
+            plt.title('Distribución de Errores')
+            plt.tight_layout()
+            plt.savefig(plots_dir / 'error_distribution.png')
+            plt.close()
+            
+            # 3. Gráfico de drift
+            drift_df = pd.DataFrame([
+                {'feature': feature, 'mean_drift': results['mean_drift']}
+                for feature, results in drift_results.items()
+            ])
+            plt.figure(figsize=(12, 6))
+            sns.barplot(data=drift_df, x='feature', y='mean_drift')
+            plt.xticks(rotation=45)
+            plt.title('Drift por Feature')
+            plt.tight_layout()
+            plt.savefig(plots_dir / 'feature_drift.png')
+            plt.close()
+            
+            logger.info("Dashboard generado exitosamente")
+            
         except Exception as e:
-            logging.error(f"Error al obtener importancia de features: {str(e)}")
+            logger.error(f"Error al generar dashboard: {str(e)}")
             raise
 
 def main():
     """
-    Función principal que ejecuta el modelo en producción.
+    Función principal para ejecutar el modelo en producción.
     """
     try:
-        # Crear directorios necesarios
-        os.makedirs('logs', exist_ok=True)
-        os.makedirs('results', exist_ok=True)
+        # Inicializar modelo
+        model = ProductionModel()
         
-        # Inicializar modelo de producción
-        model = ProductionModel(
-            model_path='models/xgboost_model.joblib',
-            scaler_path='models/scaler.joblib'
-        )
-        
-        # Cargar datos recientes
-        data_path = os.path.join('data', 'processed', 'features.csv')
-        df = pd.read_csv(data_path)
-        df['Fecha de cierre'] = pd.to_datetime(df['Fecha de cierre'])
-        
-        # Detectar drift
-        drift_metrics = model.detect_data_drift(df)
-        if any(metric['drift_detected'] for metric in drift_metrics.values()):
-            logging.warning(f"Drift detectado en features: {drift_metrics}")
+        # Cargar datos de prueba
+        df = pd.read_csv('data/processed/features_data.csv', low_memory=False)
         
         # Generar predicciones
-        predictions = model.generate_predictions(df)
+        results = model.generate_predictions(df)
         
-        # Obtener importancia de features
-        importance = model.get_feature_importance()
+        # Detectar drift
+        drift_results = model.detect_data_drift(df)
+        
+        # Evaluar predicciones
+        metrics = model.evaluate_predictions(results)
+        
+        # Guardar resultados
+        model.save_predictions(results)
+        model.save_metrics(metrics, drift_results)
         
         # Generar dashboard
-        model.generate_dashboard()
+        model.generate_dashboard(results, metrics, drift_results)
         
-        # Logging de resultados
-        logging.info("\nPredicciones generadas:")
-        logging.info(f"Número de predicciones: {len(predictions)}")
-        logging.info("\nTop 5 features más importantes:")
-        logging.info(importance.head().to_string())
+        logger.info("Ejecución del modelo en producción completada exitosamente")
         
     except Exception as e:
-        logging.error(f"Error en el proceso principal: {str(e)}")
+        logger.error(f"Error en ejecución principal: {str(e)}")
         raise
 
 if __name__ == "__main__":

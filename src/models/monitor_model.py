@@ -1,232 +1,311 @@
 import pandas as pd
 import numpy as np
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-import logging
-import os
-from datetime import datetime, timedelta
-import joblib
-import json
 from pathlib import Path
+import json
+import logging
+from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+import seaborn as sns
+from typing import Dict, List, Optional
+import os
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import smtplib
 
 # Configurar logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('logs/model_monitoring.log'),
+        logging.FileHandler('logs/monitor_model.log'),
         logging.StreamHandler()
     ]
 )
+logger = logging.getLogger(__name__)
 
 class ModelMonitor:
-    def __init__(self, model_path, threshold_rmse=1000, threshold_mae=500):
+    """
+    Clase para monitorear el rendimiento del modelo en producción.
+    """
+    
+    def __init__(self,
+                 results_dir: str = 'results/production',
+                 alert_thresholds: Optional[Dict] = None,
+                 email_config: Optional[Dict] = None):
         """
         Inicializa el monitor del modelo.
         
         Args:
-            model_path: Ruta al modelo guardado
-            threshold_rmse: Umbral de alerta para RMSE
-            threshold_mae: Umbral de alerta para MAE
+            results_dir: Directorio con los resultados de producción
+            alert_thresholds: Umbrales para alertas
+            email_config: Configuración para envío de alertas por email
         """
-        self.model_path = model_path
-        self.threshold_rmse = threshold_rmse
-        self.threshold_mae = threshold_mae
-        self.model = joblib.load(model_path)
-        self.metrics_history = []
-        
-    def load_recent_data(self, days=30):
-        """
-        Carga los datos más recientes para evaluación.
-        
-        Args:
-            days: Número de días de datos a cargar
-            
-        Returns:
-            DataFrame con los datos recientes
-        """
+        self.results_dir = Path(results_dir)
+        self.alert_thresholds = alert_thresholds or {
+            'rmse': 100.0,
+            'mae': 50.0,
+            'mape': 5.0,
+            'drift': 0.1
+        }
+        self.email_config = email_config
+        self._setup_monitoring()
+    
+    def _setup_monitoring(self) -> None:
+        """Configura el sistema de monitoreo."""
         try:
-            # Cargar datos procesados
-            data_path = os.path.join('data', 'processed', 'features.csv')
-            df = pd.read_csv(data_path)
+            # Crear directorios necesarios
+            self.results_dir.mkdir(parents=True, exist_ok=True)
+            self.monitoring_dir = self.results_dir / 'monitoring'
+            self.monitoring_dir.mkdir(exist_ok=True)
             
-            # Convertir columna de fecha
-            df['Fecha de cierre'] = pd.to_datetime(df['Fecha de cierre'])
+            # Crear archivo de historial si no existe
+            self.history_file = self.monitoring_dir / 'monitoring_history.json'
+            if not self.history_file.exists():
+                self._save_history([])
             
-            # Filtrar datos recientes
-            cutoff_date = datetime.now() - timedelta(days=days)
-            recent_data = df[df['Fecha de cierre'] >= cutoff_date]
+            logger.info("Sistema de monitoreo configurado exitosamente")
             
-            return recent_data
         except Exception as e:
-            logging.error(f"Error al cargar datos recientes: {str(e)}")
+            logger.error(f"Error al configurar monitoreo: {str(e)}")
             raise
     
-    def prepare_data(self, df):
-        """
-        Prepara los datos para el modelo.
-        
-        Args:
-            df: DataFrame con los datos
-            
-        Returns:
-            DataFrame preparado para el modelo
-        """
+    def _load_history(self) -> List[Dict]:
+        """Carga el historial de monitoreo."""
         try:
-            # Crear features de interacción
-            df['Importe_FX_Volumen_Promedio'] = df['Importe FX'] * df['Volumen_promedio_diario']
-            df['Importe_FX_Spread'] = df['Importe FX'] * df['Spread_TC']
-            df['Volumen_Ponderado_Spread'] = df['Volumen_Ponderado_5'] * df['Spread_TC']
-            df['Volumen_Importe_Ratio'] = df['Volumen_diario'] / df['Importe FX']
-            df['Spread_Volumen_Ratio'] = df['Spread_TC'] / df['Volumen_diario']
-            
-            # Eliminar columnas no necesarias
-            categorical_columns = [
-                'Codigo del Cliente (IBS)',
-                'Mes del año',
-                'Día de la semana nombre',
-                'Categoria_Cliente',
-                'Frecuencia_Cliente',
-                'Proxima_Fecha'
-            ]
-            
-            df = df.drop(categorical_columns + ['Fecha de cierre', 'Volumen_diario'], axis=1, errors='ignore')
-            
-            # Normalizar features
-            numeric_columns = df.select_dtypes(include=['float64', 'int64']).columns
-            for col in numeric_columns:
-                if df[col].isnull().any():
-                    df[col] = df[col].fillna(df[col].mean())
-                    df[col] = df[col].ffill().bfill()
-                    df[col] = df[col].fillna(0)
-            
-            return df
+            with open(self.history_file, 'r') as f:
+                return json.load(f)
         except Exception as e:
-            logging.error(f"Error al preparar datos: {str(e)}")
+            logger.error(f"Error al cargar historial: {str(e)}")
+            return []
+    
+    def _save_history(self, history: List[Dict]) -> None:
+        """Guarda el historial de monitoreo."""
+        try:
+            with open(self.history_file, 'w') as f:
+                json.dump(history, f, indent=4)
+        except Exception as e:
+            logger.error(f"Error al guardar historial: {str(e)}")
             raise
     
-    def evaluate_model(self, X, y_true):
-        """
-        Evalúa el modelo en los datos proporcionados.
-        
-        Args:
-            X: Features
-            y_true: Valores reales
-            
-        Returns:
-            Dict con métricas de evaluación
-        """
+    def _get_latest_metrics(self) -> Optional[Dict]:
+        """Obtiene las métricas más recientes."""
         try:
-            y_pred = self.model.predict(X)
+            # Obtener archivos de métricas
+            metric_files = list(self.results_dir.glob('metrics_*.json'))
+            if not metric_files:
+                return None
             
-            metrics = {
-                'rmse': np.sqrt(mean_squared_error(y_true, y_pred)),
-                'mae': mean_absolute_error(y_true, y_pred),
-                'r2': r2_score(y_true, y_pred),
-                'timestamp': datetime.now().isoformat()
-            }
+            # Obtener el archivo más reciente
+            latest_file = max(metric_files, key=lambda x: x.stat().st_mtime)
             
-            return metrics
+            with open(latest_file, 'r') as f:
+                return json.load(f)
+            
         except Exception as e:
-            logging.error(f"Error al evaluar modelo: {str(e)}")
-            raise
+            logger.error(f"Error al obtener métricas recientes: {str(e)}")
+            return None
     
-    def check_alerts(self, metrics):
+    def _check_alerts(self, metrics: Dict) -> List[str]:
         """
         Verifica si hay alertas basadas en las métricas.
         
         Args:
-            metrics: Dict con métricas de evaluación
+            metrics: Diccionario con métricas
             
         Returns:
-            Lista de alertas
+            List[str]: Lista de mensajes de alerta
         """
         alerts = []
         
-        if metrics['rmse'] > self.threshold_rmse:
-            alerts.append(f"RMSE ({metrics['rmse']:.2f}) excede el umbral ({self.threshold_rmse})")
-        
-        if metrics['mae'] > self.threshold_mae:
-            alerts.append(f"MAE ({metrics['mae']:.2f}) excede el umbral ({self.threshold_mae})")
-        
-        if metrics['r2'] < 0.9:
-            alerts.append(f"R² ({metrics['r2']:.4f}) está por debajo del umbral (0.9)")
-        
-        return alerts
+        try:
+            # Verificar RMSE
+            if metrics['metrics']['rmse'] > self.alert_thresholds['rmse']:
+                alerts.append(f"RMSE ({metrics['metrics']['rmse']:.2f}) excede el umbral ({self.alert_thresholds['rmse']})")
+            
+            # Verificar MAE
+            if metrics['metrics']['mae'] > self.alert_thresholds['mae']:
+                alerts.append(f"MAE ({metrics['metrics']['mae']:.2f}) excede el umbral ({self.alert_thresholds['mae']})")
+            
+            # Verificar MAPE
+            if metrics['metrics']['mape'] > self.alert_thresholds['mape']:
+                alerts.append(f"MAPE ({metrics['metrics']['mape']:.2f}%) excede el umbral ({self.alert_thresholds['mape']}%)")
+            
+            # Verificar drift
+            for feature, drift in metrics['drift_results'].items():
+                if drift['mean_drift'] > self.alert_thresholds['drift']:
+                    alerts.append(f"Drift detectado en feature {feature}: {drift['mean_drift']:.2f}")
+            
+            return alerts
+            
+        except Exception as e:
+            logger.error(f"Error al verificar alertas: {str(e)}")
+            return []
     
-    def save_metrics(self, metrics):
+    def _send_alert_email(self, alerts: List[str], metrics: Dict) -> None:
         """
-        Guarda las métricas en el historial.
+        Envía alertas por email.
         
         Args:
-            metrics: Dict con métricas de evaluación
+            alerts: Lista de mensajes de alerta
+            metrics: Diccionario con métricas
         """
+        if not self.email_config:
+            return
+        
         try:
-            self.metrics_history.append(metrics)
+            # Crear mensaje
+            msg = MIMEMultipart()
+            msg['Subject'] = 'Alertas de Monitoreo del Modelo FX'
+            msg['From'] = self.email_config['from']
+            msg['To'] = self.email_config['to']
             
-            # Guardar en archivo
-            metrics_path = Path('results/metrics_history.json')
-            with open(metrics_path, 'w') as f:
-                json.dump(self.metrics_history, f, indent=4)
+            # Crear cuerpo del mensaje
+            body = "Se han detectado las siguientes alertas:\n\n"
+            for alert in alerts:
+                body += f"- {alert}\n"
             
-            logging.info(f"Métricas guardadas en {metrics_path}")
+            body += "\nMétricas actuales:\n"
+            for metric, value in metrics['metrics'].items():
+                body += f"- {metric}: {value:.4f}\n"
+            
+            msg.attach(MIMEText(body, 'plain'))
+            
+            # Enviar email
+            with smtplib.SMTP(self.email_config['smtp_server'], self.email_config['smtp_port']) as server:
+                server.starttls()
+                server.login(self.email_config['username'], self.email_config['password'])
+                server.send_message(msg)
+            
+            logger.info("Alertas enviadas por email exitosamente")
+            
         except Exception as e:
-            logging.error(f"Error al guardar métricas: {str(e)}")
-            raise
+            logger.error(f"Error al enviar alertas por email: {str(e)}")
     
-    def run_monitoring(self):
+    def _generate_monitoring_plots(self, history: List[Dict]) -> None:
         """
-        Ejecuta el proceso de monitoreo completo.
+        Genera gráficos de monitoreo.
+        
+        Args:
+            history: Historial de monitoreo
         """
         try:
-            # Cargar datos recientes
-            recent_data = self.load_recent_data()
+            # Crear DataFrame con historial
+            df = pd.DataFrame(history)
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
             
-            # Preparar datos
-            X = self.prepare_data(recent_data)
-            y_true = recent_data['Volumen_diario']
+            # 1. Gráfico de métricas a lo largo del tiempo
+            plt.figure(figsize=(12, 6))
+            metrics_data = []
+            for _, row in df.iterrows():
+                for metric, value in row['metrics'].items():
+                    metrics_data.append({
+                        'timestamp': row['timestamp'],
+                        'metric': metric,
+                        'value': value
+                    })
             
-            # Evaluar modelo
-            metrics = self.evaluate_model(X, y_true)
+            metrics_df = pd.DataFrame(metrics_data)
+            sns.lineplot(data=metrics_df, x='timestamp', y='value', hue='metric')
+            plt.title('Métricas de Rendimiento a lo largo del Tiempo')
+            plt.xlabel('Fecha')
+            plt.ylabel('Valor')
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+            plt.savefig(self.monitoring_dir / 'metrics_over_time.png')
+            plt.close()
+            
+            # 2. Gráfico de drift por feature
+            drift_data = []
+            for _, row in df.iterrows():
+                for feature, drift in row['drift_results'].items():
+                    drift_data.append({
+                        'timestamp': row['timestamp'],
+                        'feature': feature,
+                        'mean_drift': drift['mean_drift']
+                    })
+            
+            drift_df = pd.DataFrame(drift_data)
+            drift_df['timestamp'] = pd.to_datetime(drift_df['timestamp'])
+            
+            plt.figure(figsize=(12, 6))
+            sns.lineplot(data=drift_df, x='timestamp', y='mean_drift', hue='feature')
+            plt.title('Drift por Feature a lo largo del Tiempo')
+            plt.xlabel('Fecha')
+            plt.ylabel('Drift')
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+            plt.savefig(self.monitoring_dir / 'drift_over_time.png')
+            plt.close()
+            
+            logger.info("Gráficos de monitoreo generados exitosamente")
+            
+        except Exception as e:
+            logger.error(f"Error al generar gráficos de monitoreo: {str(e)}")
+    
+    def run_monitoring(self) -> None:
+        """Ejecuta el proceso de monitoreo."""
+        try:
+            logger.info("Iniciando monitoreo del modelo")
+            
+            # Obtener métricas recientes
+            metrics = self._get_latest_metrics()
+            if not metrics:
+                logger.warning("No se encontraron métricas recientes")
+                return
             
             # Verificar alertas
-            alerts = self.check_alerts(metrics)
+            alerts = self._check_alerts(metrics)
             
-            # Guardar métricas
-            self.save_metrics(metrics)
-            
-            # Logging de resultados
-            logging.info("\nResultados del monitoreo:")
-            logging.info(f"RMSE: {metrics['rmse']:.2f}")
-            logging.info(f"MAE: {metrics['mae']:.2f}")
-            logging.info(f"R²: {metrics['r2']:.4f}")
-            
+            # Si hay alertas, enviarlas por email
             if alerts:
-                logging.warning("\nAlertas detectadas:")
-                for alert in alerts:
-                    logging.warning(alert)
-            else:
-                logging.info("\nNo se detectaron alertas")
+                logger.warning(f"Alertas detectadas: {alerts}")
+                self._send_alert_email(alerts, metrics)
+            
+            # Actualizar historial
+            history = self._load_history()
+            history.append(metrics)
+            
+            # Mantener solo los últimos 30 días
+            cutoff_date = datetime.now() - timedelta(days=30)
+            history = [
+                entry for entry in history
+                if datetime.fromisoformat(entry['timestamp']) > cutoff_date
+            ]
+            
+            self._save_history(history)
+            
+            # Generar gráficos
+            self._generate_monitoring_plots(history)
+            
+            logger.info("Monitoreo completado exitosamente")
             
         except Exception as e:
-            logging.error(f"Error en el proceso de monitoreo: {str(e)}")
+            logger.error(f"Error en monitoreo: {str(e)}")
             raise
 
 def main():
     """
-    Función principal que ejecuta el monitoreo del modelo.
+    Función principal para ejecutar el monitoreo.
     """
     try:
-        # Crear directorio de logs si no existe
-        os.makedirs('logs', exist_ok=True)
+        # Configuración de email (opcional)
+        email_config = {
+            'smtp_server': os.getenv('SMTP_SERVER', 'smtp.gmail.com'),
+            'smtp_port': int(os.getenv('SMTP_PORT', '587')),
+            'username': os.getenv('EMAIL_USERNAME'),
+            'password': os.getenv('EMAIL_PASSWORD'),
+            'from': os.getenv('EMAIL_FROM'),
+            'to': os.getenv('EMAIL_TO')
+        }
         
         # Inicializar monitor
-        monitor = ModelMonitor('models/xgboost_model.joblib')
+        monitor = ModelMonitor(email_config=email_config)
         
         # Ejecutar monitoreo
         monitor.run_monitoring()
         
     except Exception as e:
-        logging.error(f"Error en el proceso principal: {str(e)}")
+        logger.error(f"Error en ejecución principal: {str(e)}")
         raise
 
 if __name__ == "__main__":

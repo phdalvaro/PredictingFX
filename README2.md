@@ -6,7 +6,7 @@ Sistema avanzado de predicción de volúmenes de operaciones FX que utiliza inte
 ## Características Principales
 
 ### Predicciones
-- Pronósticos de volumen diario de operaciones FX
+- Pronósticos de volumen diario de operaciones FX a nivel id
 - Intervalos de confianza dinámicos
 - Predicciones a 7 días vista
 - Actualización automática diaria
