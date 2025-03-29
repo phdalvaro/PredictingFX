@@ -9,6 +9,10 @@ from prophet_model import ProphetForecaster
 import joblib
 from prophet import Prophet
 from xgboost import XGBRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import GridSearchCV
+from sklearn.ensemble import StackingRegressor
+from sklearn.linear_model import RidgeCV
 
 # Configurar logging
 logging.basicConfig(
@@ -110,9 +114,100 @@ def plot_predictions(test_df, prophet_pred, xgboost_pred, save_path):
         logging.error(f"Error al generar gráfico: {str(e)}")
         raise
 
+def calculate_mad(series):
+    """
+    Calcula la Desviación Absoluta Mediana (MAD) de una serie.
+    
+    Args:
+        series: pandas Series
+        
+    Returns:
+        float: MAD value
+    """
+    median = series.median()
+    mad = (series - median).abs().median()
+    return mad
+
+def prepare_data_for_prophet(df):
+    """
+    Prepara los datos para Prophet.
+    
+    Args:
+        df: DataFrame con los datos
+        
+    Returns:
+        DataFrame preparado para Prophet
+    """
+    # Crear una copia del DataFrame
+    prophet_df = df.copy()
+    
+    # Preparar columnas para Prophet
+    prophet_df['ds'] = prophet_df['Fecha de cierre']
+    prophet_df['y'] = prophet_df['Volumen_diario']
+    
+    # Lista de regresores más importantes
+    regressors = [
+        'Importe FX',
+        'Volumen_promedio_diario',
+        'Volumen_Ponderado_5',
+        'Spread_TC'
+    ]
+    
+    # Normalizar regresores
+    for regressor in regressors:
+        if regressor in prophet_df.columns:
+            # Calcular estadísticas robustas
+            q1 = prophet_df[regressor].quantile(0.25)
+            q3 = prophet_df[regressor].quantile(0.75)
+            iqr = q3 - q1
+            lower_bound = q1 - 1.5 * iqr
+            upper_bound = q3 + 1.5 * iqr
+            
+            # Manejar outliers
+            prophet_df[regressor] = prophet_df[regressor].clip(lower_bound, upper_bound)
+            
+            # Normalizar usando robust scaler
+            median = prophet_df[regressor].median()
+            mad = calculate_mad(prophet_df[regressor])
+            prophet_df[regressor] = (prophet_df[regressor] - median) / mad
+            
+            # Manejar valores nulos
+            prophet_df[regressor] = prophet_df[regressor].fillna(0)
+    
+    # Eliminar columnas que no son regresores ni ds/y
+    columns_to_keep = ['ds', 'y'] + regressors
+    prophet_df = prophet_df[columns_to_keep]
+    
+    return prophet_df, regressors
+
+def create_interaction_features(df):
+    """
+    Crea features de interacción basadas en las features más importantes.
+    
+    Args:
+        df: DataFrame con los datos
+        
+    Returns:
+        DataFrame con nuevas features
+    """
+    df = df.copy()
+    
+    # Crear interacciones con Importe FX
+    df['Importe_FX_Volumen_Promedio'] = df['Importe FX'] * df['Volumen_promedio_diario']
+    df['Importe_FX_Spread'] = df['Importe FX'] * df['Spread_TC']
+    
+    # Crear interacciones con Volumen_Ponderado_5
+    df['Volumen_Ponderado_Spread'] = df['Volumen_Ponderado_5'] * df['Spread_TC']
+    
+    # Crear ratios
+    df['Volumen_Importe_Ratio'] = df['Volumen_diario'] / df['Importe FX']
+    df['Spread_Volumen_Ratio'] = df['Spread_TC'] / df['Volumen_diario']
+    
+    return df
+
 def prepare_data_for_xgboost(df):
     """
-    Prepara los datos para XGBoost.
+    Prepara los datos para XGBoost con feature engineering mejorado.
     
     Args:
         df: DataFrame con los datos
@@ -122,6 +217,9 @@ def prepare_data_for_xgboost(df):
     """
     # Crear una copia del DataFrame
     df_xgb = df.copy()
+    
+    # Crear features de interacción
+    df_xgb = create_interaction_features(df_xgb)
     
     # Convertir columnas categóricas a numéricas
     categorical_columns = [
@@ -150,61 +248,112 @@ def prepare_data_for_xgboost(df):
                 # Si aún hay valores nulos después de todo, usar 0
                 df_xgb[col] = df_xgb[col].fillna(0)
     
+    # Normalizar features
+    scaler = StandardScaler()
+    df_xgb[numeric_columns] = scaler.fit_transform(df_xgb[numeric_columns])
+    
     return df_xgb
 
-def prepare_data_for_prophet(df):
+def optimize_xgboost(X_train, y_train):
     """
-    Prepara los datos para Prophet.
+    Optimiza los hiperparámetros de XGBoost usando GridSearchCV.
     
     Args:
-        df: DataFrame con los datos
+        X_train: Features de entrenamiento
+        y_train: Target de entrenamiento
         
     Returns:
-        DataFrame preparado para Prophet
+        Mejor modelo XGBoost
     """
-    # Crear una copia del DataFrame
-    prophet_df = df.copy()
+    # Definir el espacio de búsqueda de hiperparámetros (reducido)
+    param_grid = {
+        'n_estimators': [500, 1000],
+        'max_depth': [5, 7],
+        'learning_rate': [0.01, 0.05],
+        'subsample': [0.8, 0.9],
+        'colsample_bytree': [0.8, 0.9],
+        'min_child_weight': [1, 3],
+        'gamma': [0, 0.1]
+    }
     
-    # Preparar columnas para Prophet
-    prophet_df['ds'] = prophet_df['Fecha de cierre']
-    prophet_df['y'] = prophet_df['Volumen_diario']
+    # Crear el modelo base sin early stopping
+    base_model = XGBRegressor(
+        objective='reg:squarederror',
+        random_state=42,
+        eval_metric='rmse'
+    )
     
-    # Lista de regresores que queremos usar
-    regressors = [
-        'volumen_rolling_7d_mean',
-        'volumen_rolling_30d_mean',
-        'Spread_TC',
-        'total_operaciones',
-        'Volumen_Ponderado_5'
+    # Crear el GridSearchCV con menos workers
+    grid_search = GridSearchCV(
+        estimator=base_model,
+        param_grid=param_grid,
+        cv=3,  # Reducir el número de folds
+        scoring='neg_root_mean_squared_error',
+        n_jobs=1,  # Usar un solo worker
+        verbose=1
+    )
+    
+    # Realizar la búsqueda
+    grid_search.fit(X_train, y_train)
+    
+    # Obtener el mejor modelo
+    best_model = grid_search.best_estimator_
+    
+    # Logging de los mejores parámetros
+    logging.info("Mejores hiperparámetros encontrados:")
+    for param, value in grid_search.best_params_.items():
+        logging.info(f"{param}: {value}")
+    
+    return best_model
+
+def create_stacking_model(X_train, y_train):
+    """
+    Crea un modelo de stacking combinando múltiples modelos XGBoost.
+    
+    Args:
+        X_train: Features de entrenamiento
+        y_train: Target de entrenamiento
+        
+    Returns:
+        Modelo de stacking
+    """
+    # Crear modelos base (reducidos)
+    base_models = [
+        ('xgb1', XGBRegressor(
+            n_estimators=1000,
+            learning_rate=0.01,
+            max_depth=7,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=42,
+            eval_metric='rmse'
+        )),
+        ('xgb2', XGBRegressor(
+            n_estimators=1000,
+            learning_rate=0.05,
+            max_depth=5,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            random_state=43,
+            eval_metric='rmse'
+        ))
     ]
     
-    # Manejar valores faltantes en los regresores
-    for regressor in regressors:
-        if regressor in prophet_df.columns:
-            if prophet_df[regressor].isnull().any():
-                # Calcular la media excluyendo valores nulos
-                mean_value = prophet_df[regressor].mean()
-                # Rellenar valores nulos con la media
-                prophet_df[regressor] = prophet_df[regressor].fillna(mean_value)
-                # Si aún hay valores nulos, usar forward fill y backward fill
-                if prophet_df[regressor].isnull().any():
-                    prophet_df[regressor] = prophet_df[regressor].ffill().bfill()
-                    # Si aún hay valores nulos después de todo, usar 0
-                    prophet_df[regressor] = prophet_df[regressor].fillna(0)
-        else:
-            logging.warning(f"Regresor {regressor} no encontrado en los datos. Se omitirá.")
-            regressors.remove(regressor)
+    # Crear el modelo final
+    final_model = RidgeCV()
     
-    # Eliminar columnas que no son regresores ni ds/y
-    columns_to_keep = ['ds', 'y'] + regressors
-    prophet_df = prophet_df[columns_to_keep]
+    # Crear el modelo de stacking con menos workers
+    stacking_model = StackingRegressor(
+        estimators=base_models,
+        final_estimator=final_model,
+        cv=3,  # Reducir el número de folds
+        n_jobs=1  # Usar un solo worker
+    )
     
-    # Verificar que no haya valores nulos en el DataFrame final
-    null_columns = prophet_df.columns[prophet_df.isnull().any()].tolist()
-    if null_columns:
-        raise ValueError(f"Aún hay valores nulos en las columnas: {null_columns}")
+    # Entrenar el modelo
+    stacking_model.fit(X_train, y_train)
     
-    return prophet_df, regressors
+    return stacking_model
 
 def main():
     """
@@ -240,12 +389,23 @@ def main():
         
         # Entrenar modelo Prophet
         logging.info("Entrenando modelo Prophet...")
-        prophet = Prophet()
+        prophet = Prophet(
+            changepoint_prior_scale=0.001,
+            seasonality_prior_scale=0.01,
+            holidays_prior_scale=0.01,
+            seasonality_mode='multiplicative',
+            daily_seasonality=True,
+            weekly_seasonality=True,
+            yearly_seasonality=True,
+            changepoint_range=0.7,
+            n_changepoints=15,
+            interval_width=0.95
+        )
         
-        # Agregar regresores al modelo
         for regressor in regressors:
             prophet.add_regressor(regressor)
         
+        prophet.add_country_holidays(country_name='US')
         prophet.fit(train_prophet_df)
         logging.info("Modelo Prophet entrenado exitosamente")
         
@@ -259,27 +419,38 @@ def main():
         X_test = prepare_data_for_xgboost(test_df)
         y_test = test_df['Volumen_diario']
         
-        # Entrenar modelo XGBoost
-        logging.info("Entrenando modelo XGBoost...")
-        xgb_model = XGBRegressor(random_state=42)
-        xgb_model.fit(X_train, y_train)
-        logging.info("Modelo XGBoost entrenado exitosamente")
+        # Optimizar y entrenar modelo XGBoost
+        logging.info("Optimizando hiperparámetros de XGBoost...")
+        xgb_model = optimize_xgboost(X_train, y_train)
         
-        # Generar pronósticos con XGBoost
+        # Crear y entrenar modelo de stacking
+        logging.info("Entrenando modelo de stacking...")
+        stacking_model = create_stacking_model(X_train, y_train)
+        
+        # Generar pronósticos
         xgb_pred = xgb_model.predict(X_test)
+        stacking_pred = stacking_model.predict(X_test)
         
         # Calcular métricas
         prophet_rmse = np.sqrt(mean_squared_error(y_test, prophet_pred))
         prophet_mae = mean_absolute_error(y_test, prophet_pred)
         xgb_rmse = np.sqrt(mean_squared_error(y_test, xgb_pred))
         xgb_mae = mean_absolute_error(y_test, xgb_pred)
+        stacking_rmse = np.sqrt(mean_squared_error(y_test, stacking_pred))
+        stacking_mae = mean_absolute_error(y_test, stacking_pred)
+        
+        # Calcular R²
+        prophet_r2 = r2_score(y_test, prophet_pred)
+        xgb_r2 = r2_score(y_test, xgb_pred)
+        stacking_r2 = r2_score(y_test, stacking_pred)
         
         # Crear DataFrame con resultados
         results = pd.DataFrame({
             'Fecha': test_df['Fecha de cierre'],
             'Real': y_test,
             'Prophet': prophet_pred,
-            'XGBoost': xgb_pred
+            'XGBoost': xgb_pred,
+            'Stacking': stacking_pred
         })
         
         # Crear directorio de resultados si no existe
@@ -291,8 +462,18 @@ def main():
         
         # Imprimir métricas
         logging.info("\nMétricas de evaluación:")
-        logging.info("Prophet - RMSE: %.2f, MAE: %.2f", prophet_rmse, prophet_mae)
-        logging.info("XGBoost - RMSE: %.2f, MAE: %.2f", xgb_rmse, xgb_mae)
+        logging.info("Prophet - RMSE: %.2f, MAE: %.2f, R²: %.4f", prophet_rmse, prophet_mae, prophet_r2)
+        logging.info("XGBoost - RMSE: %.2f, MAE: %.2f, R²: %.4f", xgb_rmse, xgb_mae, xgb_r2)
+        logging.info("Stacking - RMSE: %.2f, MAE: %.2f, R²: %.4f", stacking_rmse, stacking_mae, stacking_r2)
+        
+        # Guardar importancia de features
+        feature_importance = pd.DataFrame({
+            'feature': X_train.columns,
+            'importance': xgb_model.feature_importances_
+        })
+        feature_importance = feature_importance.sort_values('importance', ascending=False)
+        feature_importance.to_csv('results/feature_importance.csv', index=False)
+        logging.info("Importancia de features guardada en results/feature_importance.csv")
         
     except Exception as e:
         logging.error("Error en el proceso principal: %s", str(e))

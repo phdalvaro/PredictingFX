@@ -1,9 +1,4 @@
-# Entornos virtuales
-venv/
-env/
-ENV/
-
-# Archivos Python
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -25,7 +20,13 @@ wheels/
 .installed.cfg
 *.egg
 
-# IDEs y editores
+# Entornos virtuales
+venv/
+env/
+ENV/
+.env
+
+# IDEs
 .idea/
 .vscode/
 *.swp
@@ -36,14 +37,23 @@ wheels/
 logs/
 *.log
 
-# Datos procesados
+# Datos sensibles
+security/key.key
+*.pem
+*.key
+
+# Archivos de datos
+data/raw/*
 data/processed/*
+!data/raw/.gitkeep
 !data/processed/.gitkeep
 
-# Modelos entrenados
-data/processed/models/*
-!data/processed/models/.gitkeep
+# Archivos de resultados
+results/*
+!results/.gitkeep
 
-# Visualizaciones
-data/processed/visualizations/*
-!data/processed/visualizations/.gitkeep
+# Archivos de caché
+.cache/
+.pytest_cache/
+.coverage
+htmlcov/

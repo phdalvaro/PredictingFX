@@ -1,115 +1,116 @@
-# Proyecto de Predicción de Volumen FX
+# Modelo de Predicción de Volúmenes FX
+
+## Descripción
+Sistema de predicción de volúmenes de operaciones FX utilizando machine learning, implementado en producción con monitoreo continuo y validaciones de seguridad.
+
+## Características Principales
+- Predicción de volúmenes FX usando XGBoost
+- Sistema de monitoreo en tiempo real
+- Detección de drift de datos
+- Dashboard interactivo
+- Validaciones de seguridad robustas
+- Sistema de logging detallado
+- Pruebas de integración completas
 
 ## Estructura del Proyecto
 ```
-ToDo/Fx/
-├── data/
-│   ├── raw/                 # Datos originales
-│   └── processed/           # Datos procesados y features
-│       ├── cleaned_data.csv # Datos limpios
-│       ├── features.csv     # Features generadas
-│       └── forecasts/       # Pronósticos generados
+Fx/
 ├── src/
-│   ├── preprocessing/       # Scripts de preprocesamiento
-│   │   ├── clean_data.py   # Limpieza de datos
-│   │   └── create_features.py # Generación de features
-│   └── models/             # Scripts de modelos
-│       ├── train_models.py # Entrenamiento de modelos
-│       └── compare_models.py # Comparación de modelos
-├── models/                 # Modelos entrenados
-├── results/               # Resultados y métricas
-├── logs/                  # Logs de ejecución
-└── requirements.txt       # Dependencias del proyecto
+│   ├── models/
+│   │   └── production_model.py
+│   ├── data/
+│   │   ├── data_processor.py
+│   │   └── feature_engineering.py
+│   └── utils/
+│       └── security.py
+├── tests/
+│   ├── unit/
+│   │   └── test_production_model.py
+│   └── integration/
+│       └── test_model_pipeline.py
+├── docs/
+│   ├── api.md
+│   └── security.md
+├── models/
+│   ├── xgboost_model.joblib
+│   └── scaler.joblib
+├── data/
+│   ├── raw/
+│   └── processed/
+├── results/
+│   ├── predictions_history.json
+│   ├── metrics_history.json
+│   └── dashboard.html
+├── logs/
+│   └── security/
+├── security/
+│   └── key.key
+├── requirements.txt
+├── setup.py
+├── README.md
+├── README2.md
+├── CONTRIBUTING.md
+└── CHANGELOG.md
 ```
 
 ## Requisitos
 - Python 3.8+
-- pandas
-- numpy
-- scikit-learn
-- xgboost
-- prophet
-- matplotlib
-- seaborn
+- Dependencias listadas en `requirements.txt`
 
 ## Instalación
-1. Clonar el repositorio
-2. Crear un entorno virtual:
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # En Windows: venv\Scripts\activate
-   ```
+1. Clonar el repositorio:
+```bash
+git clone https://github.com/tu-usuario/fx-prediction.git
+cd fx-prediction
+```
+
+2. Crear entorno virtual:
+```bash
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+venv\Scripts\activate     # Windows
+```
+
 3. Instalar dependencias:
-   ```bash
-   pip install -r requirements.txt
-   ```
+```bash
+pip install -r requirements.txt
+```
 
-## Proceso de Ejecución
-1. **Preprocesamiento de Datos**:
-   ```bash
-   python src/preprocessing/clean_data.py
-   python src/preprocessing/create_features.py
-   ```
+## Uso
+1. Configurar las rutas de los modelos y datos en `config.py`
+2. Ejecutar el modelo:
+```bash
+python src/models/production_model.py
+```
 
-2. **Entrenamiento y Comparación de Modelos**:
-   ```bash
-   python src/models/train_models.py
-   python src/models/compare_models.py
-   ```
+## Monitoreo
+- Dashboard interactivo en `results/dashboard.html`
+- Logs de seguridad en `logs/security/`
+- Métricas de rendimiento en `results/metrics_history.json`
 
-## Mejoras Introducidas
-1. **Preprocesamiento**:
-   - Implementación de manejo robusto de valores nulos
-   - Normalización de variables numéricas
-   - Codificación de variables categóricas
+## Seguridad
+- Encriptación de datos sensibles
+- Validación de integridad de modelos
+- Rotación automática de logs
+- Permisos de archivos seguros
 
-2. **Features**:
-   - Features temporales (día de la semana, mes, etc.)
-   - Features de volumen (promedios móviles, desviaciones)
-   - Features de tipo de cambio
-   - Features de cliente
-   - Features de predicción de próximas operaciones
+## Pruebas
+```bash
+# Ejecutar todas las pruebas
+pytest
 
-3. **Modelos**:
-   - Implementación de XGBoost con hiperparámetros optimizados
-   - Modelo Prophet para comparación
-   - Sistema de evaluación comparativa
+# Ejecutar pruebas unitarias
+pytest tests/unit/
 
-## Resultados Actuales
-1. **Modelo de Volumen**:
-   - RMSE: 1,821.26
-   - MAE: 248.07
-   - R²: 0.95
+# Ejecutar pruebas de integración
+pytest tests/integration/
+```
 
-2. **Modelo de Próximas Operaciones**:
-   - Precisión 7 días: 0.92
-   - Precisión 14 días: 0.89
-   - Precisión 30 días: 0.85
+## Contribución
+Ver [CONTRIBUTING.md](CONTRIBUTING.md) para detalles sobre el proceso de contribución.
 
-3. **Comparación con Prophet**:
-   - Prophet RMSE: 29,405.19
-   - Prophet MAE: 25,299.30
-   - XGBoost muestra mejor rendimiento
+## Licencia
+Este proyecto está licenciado bajo la Licencia MIT - ver el archivo [LICENSE](LICENSE) para más detalles.
 
-## Próximos Pasos
-1. **Optimización de Modelos**:
-   - Ajuste de hiperparámetros de Prophet
-   - Experimentación con otros algoritmos
-   - Validación cruzada temporal
-
-2. **Mejoras de Features**:
-   - Incorporación de datos externos
-   - Features de tendencia de mercado
-   - Análisis de correlaciones
-
-3. **Visualización y Reportes**:
-   - Dashboard interactivo
-   - Reportes automáticos
-   - Monitoreo de rendimiento
-
-## Notas de la Última Actualización
-- Implementación exitosa del sistema de comparación de modelos
-- Mejora significativa en el rendimiento del modelo XGBoost
-- Optimización del manejo de datos y features
-- Sistema de logging mejorado para seguimiento de errores
-- Documentación actualizada del proyecto
+## Changelog
+Ver [CHANGELOG.md](CHANGELOG.md) para la lista de cambios.
